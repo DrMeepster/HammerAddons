@@ -741,11 +741,13 @@ def action_export(
     output_path: Path,
     as_binary: bool,
     engine_mode: bool,
+    filter_ents: bool,
 ) -> None:
     """Create an FGD file using the given tags."""
     
     if engine_mode:
         tags = frozenset({'ENGINE'})
+        filter_ents = False
     else:
         tags = expand_tags(tags)
 
@@ -903,7 +905,7 @@ def action_export(
 
         for ent in ents:
             applies_to = get_appliesto(ent)
-            if match_tags(tags, applies_to):
+            if match_tags(tags, applies_to) and (not filter_ents or ent.type == EntityTypes.BASE or any(tag in tags for tag in applies_to)):
                 fgd.entities[ent.classname] = ent
                 ent.strip_tags(tags)
 
@@ -1070,6 +1072,12 @@ def main(args: List[str]=None):
         help="If specified, an additional folder to read FGD files from. "
              "These override the normal database.",
     )
+    parser.add_argument(
+        "--allow-custom-tags",
+        dest="custom_tags",
+        action="store_true",
+        help="If set, custom tags are allowed.",
+    )
     subparsers = parser.add_subparsers(dest="mode")
 
     parser_count = subparsers.add_parser(
@@ -1107,6 +1115,11 @@ def main(args: List[str]=None):
         "-b", "--binary",
         action="store_true",
         help="If set, produce a binary format used by Srctools.",
+    )
+    parser_exp.add_argument(
+        "--filter",
+        action="store_true",
+        help="If set, don't include untagged entities, other than base classes",
     )
     parser_exp.add_argument(
         "tags",
@@ -1173,13 +1186,16 @@ def main(args: List[str]=None):
             if result.tags:
                 print("Tags ignored in --engine mode...", file=sys.stderr)
             result.tags = ['ENGINE']
+
+            if result.filter:
+                print("--filter ignored in --engine mode...", file=sys.stderr)
         elif not result.tags:
             parser.error("At least one tag must be specified!")
             
         tags = validate_tags(result.tags)
         
         for tag in tags:
-            if tag not in ALL_TAGS:
+            if not result.custom_tags and tag not in ALL_TAGS:
                 parser.error(
                     'Invalid tag "{}"! Allowed tags: \n'.format(tag) +
                     format_all_tags()
@@ -1191,6 +1207,7 @@ def main(args: List[str]=None):
             result.output,
             result.binary,
             result.engine,
+            result.filter
         )
     elif result.mode in ("c", "count"):
         action_count(dbase, extra_db)
