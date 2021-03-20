@@ -741,17 +741,21 @@ def action_export(
     output_path: Path,
     as_binary: bool,
     engine_mode: bool,
-    filter_ents: bool,
+    filter_tags: Optional[FrozenSet[str]],
 ) -> None:
     """Create an FGD file using the given tags."""
     
     if engine_mode:
         tags = frozenset({'ENGINE'})
-        filter_ents = False
+        filter_tags = None
     else:
         tags = expand_tags(tags)
+        filter_tags = expand_tags(filter_tags)
 
     print('Tags expanded to: {}'.format(', '.join(tags)))
+
+    if filter_tags is not None:
+        print('Filter tags expanded to: {}'.format(', '.join(filter_tags)))
 
     fgd, base_entity_def = load_database(dbase, extra_db)
 
@@ -905,7 +909,7 @@ def action_export(
 
         for ent in ents:
             applies_to = get_appliesto(ent)
-            if match_tags(tags, applies_to) and (not filter_ents or ent.type == EntityTypes.BASE or any(tag in tags for tag in applies_to)):
+            if match_tags(tags, applies_to):
                 fgd.entities[ent.classname] = ent
                 ent.strip_tags(tags)
 
@@ -919,12 +923,34 @@ def action_export(
             if not poly_tag or poly_tag in tags:
                 polyfill(fgd)
 
+    if filter_tags:
+        include = lambda ent: match_tags(filter_tags, get_appliesto(ent)) and any(tag[:1] not in ("!", "-", "+") for tag in get_appliesto(ent))
+
+        print("Filtering entities...")
+
+        ents = list(fgd.entities.values())
+        fgd.entities.clear()
+
+        for ent in ents:
+            if include(ent):
+                fgd.entities[ent.classname] = ent
+
+                bases = list(ent.bases)
+                ent.bases.clear()
+
+                for base in bases:
+                    if isinstance(base, str) or include(base):
+                        ent.bases.append(base)
+                    else:
+                        ent.bases.append(base.classname)
+
     print('Applying helpers to child entities and optimising...')
     for ent in fgd.entities.values():
         # Merge them together.
         helpers = []
         for base in ent.bases:
-            helpers.extend(base.helpers)
+            if isinstance(base, EntityDef):
+                helpers.extend(base.helpers)
         helpers.extend(ent.helpers)
 
         # Then optimise this list.
@@ -947,33 +973,34 @@ def action_export(
             # But it itself should be added to the end regardless.
             ent.helpers.append(helper)
 
-    print('Culling unused bases...')
-    used_bases = set()  # type: Set[EntityDef]
-    # We only want to keep bases that provide keyvalues. We've merged the
-    # helpers in.
-    for ent in fgd.entities.values():
-        if ent.type is not EntityTypes.BASE:
-            for base in ent.iter_bases():
-                if base.type is EntityTypes.BASE and (
-                    base.keyvalues or base.inputs or base.outputs
-                ):
-                    used_bases.add(base)
+    if not filter_tags: #too much breaks here when string bases exist
+        print('Culling unused bases...')
+        used_bases = set()  # type: Set[EntityDef]
+        # We only want to keep bases that provide keyvalues. We've merged the
+        # helpers in.
+        for ent in fgd.entities.values():
+            if ent.type is not EntityTypes.BASE:
+                for base in ent.iter_bases():
+                    if base.type is EntityTypes.BASE and (
+                        base.keyvalues or base.inputs or base.outputs
+                    ):
+                        used_bases.add(base)
 
-    for classname, ent in list(fgd.entities.items()):
-        if ent.type is EntityTypes.BASE:
-            if ent not in used_bases:
-                del fgd.entities[classname]
-                continue
-            else:
-                # Helpers aren't inherited, so this isn't useful anymore.
-                ent.helpers.clear()
-        # Cull all base classes we don't use.
-        # Ents that inherit from each other always need to exist.
-        ent.bases = [
-            base
-            for base in ent.bases
-            if base.type is not EntityTypes.BASE or base in used_bases
-        ]
+        for classname, ent in list(fgd.entities.items()):
+            if ent.type is EntityTypes.BASE:
+                if ent not in used_bases:
+                    del fgd.entities[classname]
+                    continue
+                else:
+                    # Helpers aren't inherited, so this isn't useful anymore.
+                    ent.helpers.clear()
+            # Cull all base classes we don't use.
+            # Ents that inherit from each other always need to exist.
+            ent.bases = [
+                base
+                for base in ent.bases
+                if base.type is not EntityTypes.BASE or base in used_bases
+            ]
 
     print('Culling visgroups...')
     # Cull visgroups that no longer exist for us.
@@ -994,7 +1021,7 @@ def action_export(
             fgd.serialise(comp)
     else:
         with open(output_path, 'w', encoding='iso-8859-1') as txt_f:
-            fgd.export(txt_f)
+            fgd.export(txt_f, unevaluated_bases=filter_tags is not None)
             # BEE2 compatibility, don't make it run.
             if 'P2' in tags:
                 txt_f.write('\n// BEE 2 EDIT FLAG = 0 \n')
@@ -1118,8 +1145,8 @@ def main(args: List[str]=None):
     )
     parser_exp.add_argument(
         "--filter",
-        action="store_true",
-        help="If set, don't include untagged entities, other than base classes",
+        nargs="*",
+        help="If specified, only includes entities with these tags. Uses the tags option if blank.",
     )
     parser_exp.add_argument(
         "tags",
@@ -1193,13 +1220,19 @@ def main(args: List[str]=None):
             parser.error("At least one tag must be specified!")
             
         tags = validate_tags(result.tags)
+
+        if result.engine or result.filter is not None and len(result.filter) == 0:
+            filter = tags
+        else:
+            filter = validate_tags(result.filter)
         
-        for tag in tags:
-            if not result.custom_tags and tag not in ALL_TAGS:
-                parser.error(
-                    'Invalid tag "{}"! Allowed tags: \n'.format(tag) +
-                    format_all_tags()
-                )
+        if not result.custom_tags:
+            for tag in tags:
+                if tag not in ALL_TAGS:
+                    parser.error(
+                        'Invalid tag "{}"! Allowed tags: \n'.format(tag) +
+                        format_all_tags()
+                    )
         action_export(
             dbase,
             extra_db,
@@ -1207,7 +1240,7 @@ def main(args: List[str]=None):
             result.output,
             result.binary,
             result.engine,
-            result.filter
+            filter
         )
     elif result.mode in ("c", "count"):
         action_count(dbase, extra_db)
